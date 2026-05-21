@@ -1,163 +1,255 @@
+# aws-sftp-server
 
-# Welcome to your CDK Python project!
+AWS Transfer Family SFTP server with on-demand lifecycle management. The server is not permanently running — a Lambda function creates and destroys the underlying CloudFormation stack on demand, minimising costs while keeping SFTP access available when needed.
 
-This is a blank project for CDK development with Python.
+## Architecture
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
-
-This project is set up like a standard Python project.  The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-(or `python` for Windows) executable in your path with access to the `venv`
-package. If for any reason the automatic creation of the virtualenv fails,
-you can create the virtualenv manually.
-
-To manually create a virtualenv on MacOS and Linux:
-
-```
-$ python3 -m venv .venv
+```text
+Internet → NLB (Elastic IP) → VPC Endpoint → AWS Transfer Family (SFTP)
+                                                       ↓
+                                               S3 Storage Bucket
+                                                       ↓
+                                          handle_s3_events Lambda → Slack
 ```
 
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
+### Components
 
+| Component | Description |
+|-----------|-------------|
+| **AWS CDK (Python)** | IaC — provisions the permanent infrastructure |
+| **AWS Transfer Family** | SFTP server (VPC_ENDPOINT type) |
+| **NLB** | Internet-facing Network Load Balancer with fixed Elastic IP on port 22 |
+| **VPC Endpoint** | Interface endpoint bridging NLB → Transfer service |
+| **S3 (storage)** | Upload destination; per-user home directories |
+| **S3 (templates)** | Stores CloudFormation templates used at runtime |
+| **Secrets Manager** | Stores SSH public keys, one key per username |
+| **start_stop Lambda** | Creates or deletes the SFTP server CloudFormation stack on demand |
+| **handle_s3_events Lambda** | Sends a Slack notification on every S3 `PutObject` event |
+
+### On-demand lifecycle
+
+The SFTP server itself lives in a separate CloudFormation stack (`<project_name>-sftp-server`). The `start_stop` Lambda manages it:
+
+- `action: "start"` → `cloudformation:CreateStack` using the template in the template bucket
+- `action: "stop"` → `cloudformation:DeleteStack`
+- `action: "test"` → sends a test Slack notification
+
+This means zero Transfer Family running costs when the server is idle.
+
+---
+
+## Prerequisites
+
+- Python 3.12+
+- AWS CDK v2: `npm install -g aws-cdk`
+- An existing VPC with a public subnet
+- An Elastic IP (pre-allocated)
+- A Slack Incoming Webhook URL
+
+---
+
+## Setup
+
+### 1. Clone and install dependencies
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate.bat
+pip install -r requirements.txt
 ```
-$ source .venv/bin/activate
+
+### 2. Create the config file
+
+```bash
+cp configs/config.sample.yml configs/config.yml
 ```
 
-If you are a Windows platform, you would activate the virtualenv like this:
+Edit `configs/config.yml`:
 
+```yaml
+region: eu-west-1
+account_id: 123456789012
+
+project_name: my-project
+
+vpc:
+  id: vpc-xxxxxxxx
+  eip_allocation_id: eipalloc-xxxxxxxx
+  eip_address: 1.2.3.4
+  subnet_cidr: 10.0.1.0/24
+
+slack_webhook_url: https://hooks.slack.com/services/...
 ```
-% .venv\Scripts\activate.bat
+
+> The config file is loaded at CDK synth time and also injected as Lambda environment variables.
+
+### 3. Create SSH key secrets in AWS Secrets Manager
+
+Create a single **key-value** secret named `<project_name>-project-secrets`. Add one entry per SFTP user:
+
+| Key     | Value               |
+|---------|---------------------|
+| `Alice` | `ssh-rsa AAAA...`   |
+| `Bob`   | `ssh-rsa AAAA...`   |
+
+### 4. Create user folders in the storage bucket
+
+After the first `cdk deploy`, the `<project_name>-sftp-storage-bucket` is created. Add a folder per user/environment combination:
+
+```text
+sftp-storage-bucket/
+├── AliceStaging/
+├── AliceProduction/
+├── BobStaging/
+└── BobProduction/
 ```
 
-Once the virtualenv is activated, you can install the required dependencies.
+The folder name becomes the SFTP username and the user's home directory is scoped to it.
 
+### 5. Add users to the CloudFormation template
+
+Edit `templates/cloudformation/sftp-server.yaml`:
+
+**Parameters section** — add one entry per user:
+
+```yaml
+Parameters:
+  Alice:
+    Type: String
+    Description: SSH key lookup key for Alice
+  Bob:
+    Type: String
+    Description: SSH key lookup key for Bob
 ```
-$ pip install -r requirements.txt
-```
 
-At this point you can now synthesize the CloudFormation template for this code.
+**Resources section** — add one nested stack per user/environment:
 
-```
-$ cdk synth
-```
-
-To add additional dependencies, for example other CDK libraries, just add
-them to your `setup.py` file and rerun the `pip install -r requirements.txt`
-command.
-
-## Useful commands
-
- * `cdk ls`          list all stacks in the app
- * `cdk synth`       emits the synthesized CloudFormation template
- * `cdk deploy`      deploy this stack to your default AWS account/region
- * `cdk diff`        compare deployed stack with current state
- * `cdk docs`        open CDK documentation
-
-Enjoy!
-
-
-# Project
-
-## S3
-After the `storage` bucket is created, create the user's relative folders: 
-e.g.: if you want to create a sftp user named `FirstUser`, and you want more than one environment, create the following folders:
-- `FirstUserDevelopment`
-- `FirstUserStaging`
-- `FirstUserProduction`
-in the S3 bucket.
-Repeat this process for all users you want to have access to your sftp server.
-
-## AWS Secret Manager
-Create a `key-value` secret in AWS Secret Manager and store public ssh keys for your sftp users. <br> 
-- `key` would be the name of the sftp user.
-- `value` would be the public ssh key itself.
-
-## Cloudformation Templates
-Now you've created as many ssh keys as users you want to have access to your sftp server. <br>
-Now, edit `templates/sftp-server.yaml` file <br>
-
-### `sftp-server.yaml`
-1. `Parameters` section: add as many users name as many you've created previously.
-    ``` yaml
+```yaml
+AliceStaging:
+  Type: AWS::CloudFormation::Stack
+  Properties:
+    TemplateURL: !Sub 'https://${TemplateBucket}.s3.eu-west-1.amazonaws.com/sftp-user.yaml'
     Parameters:
-        [...]
-        ### -------------------------- ###
-        FirstUser:
-            Type: String
-            Description: User name used to retrieve the SSH key and pass to nested stack, create the sftp user
-        SecondUser:
-            Type: String
-            Description: User name used to retrieve the SSH key and pass to nested stack, create the sftp user
-        [ and so on ... ]
-        ### -------------------------- ###
-    ```
-2. Now, head op at the botton of the `Resources` section: here, add (for each environment you want) as many SFTP users as you need.
-    ``` yaml
-    Resources:
-        [...]
-            # ---------------------------------------------------- SFTP Users ----------------------------------------------------
-            
-            ### Add as many user as needed ###
-   
-            FirstUserDevelopment:
-                Type: 'AWS::CloudFormation::Stack'
-                Properties:
-                TemplateURL: !Sub 'https://${TemplateBucket}.s3.eu-west-1.amazonaws.com/sftp-user.yaml'
-                Parameters:
-                   SFTPServerId: !GetAtt SFTPServer.ServerId
-                   UserName: TestStaging
-                   SshPublicKey: !Sub '{{resolve:secretsmanager:${SecretName}:SecretString:${FirstUser}}}'
-                   ProjectName: !Ref ProjectName
-                   S3Bucket: !Ref S3Bucket
-                   UserRoleArn: !Ref UserRoleArn
-            
-            FirstUserStaging:
-                Type: 'AWS::CloudFormation::Stack'
-                Properties:
-                TemplateURL: !Sub 'https://${TemplateBucket}.s3.eu-west-1.amazonaws.com/sftp-user.yaml'
-                Parameters:
-                   SFTPServerId: !GetAtt SFTPServer.ServerId
-                   UserName: TestStaging
-                   SshPublicKey: !Sub '{{resolve:secretsmanager:${SecretName}:SecretString:${FirstUser}}}'
-                   ProjectName: !Ref ProjectName
-                   S3Bucket: !Ref S3Bucket
-                   UserRoleArn: !Ref UserRoleArn
-            
-            FirstUserProduction:
-                Type: 'AWS::CloudFormation::Stack'
-                Properties:
-                TemplateURL: !Sub 'https://${TemplateBucket}.s3.eu-west-1.amazonaws.com/sftp-user.yaml'
-                Parameters:
-                   SFTPServerId: !GetAtt SFTPServer.ServerId
-                   UserName: TestProduction
-                   SshPublicKey: !Sub '{{resolve:secretsmanager:${SecretName}:SecretString:${FirstUser}}}'
-                   ProjectName: !Ref ProjectName
-                   S3Bucket: !Ref S3Bucket
-                   UserRoleArn: !Ref UserRoleArn
-            
-            [ and so on ... ]
-            # ---------------------------------------------------- SFTP Users ----------------------------------------------------
-    ```
+      SFTPServerId: !GetAtt SFTPServer.ServerId
+      UserName: AliceStaging
+      SshPublicKey: !Sub '{{resolve:secretsmanager:${SecretName}:SecretString:${Alice}}}'
+      ProjectName: !Ref ProjectName
+      S3Bucket: !Ref S3Bucket
+      UserRoleArn: !Ref UserRoleArn
 
+AliceProduction:
+  Type: AWS::CloudFormation::Stack
+  Properties:
+    TemplateURL: !Sub 'https://${TemplateBucket}.s3.eu-west-1.amazonaws.com/sftp-user.yaml'
+    Parameters:
+      SFTPServerId: !GetAtt SFTPServer.ServerId
+      UserName: AliceProduction
+      SshPublicKey: !Sub '{{resolve:secretsmanager:${SecretName}:SecretString:${Alice}}}'
+      ProjectName: !Ref ProjectName
+      S3Bucket: !Ref S3Bucket
+      UserRoleArn: !Ref UserRoleArn
+```
 
-## Lambda Function
-In order to deploy the lambda function, create a zip file and upload it to the lambda function.
-Example: let's zip and deploy ``start_stop_sftp_server`` lambda function.
-``` bash
+### 6. Build the start/stop Lambda package
+
+The `handle_s3_events` Lambda has no external dependencies and is deployed directly from source.  
+The `start_stop_sftp_server` Lambda requires a zip package:
+
+```bash
 cd templates/lambda/start_stop_sftp_server
 
 mkdir package
-
 pip install -r requirements.txt -t package/
-
-cp start_stop_sftp_server.py package/
-
+cp sftp_start_stop_aws_lambda.py package/
 cd package/
-
 zip -r ../function.zip .
-
+cd ../../..
 ```
 
+### 7. Upload CloudFormation templates to S3
 
+After the first deploy (so the template bucket exists), upload the templates:
+
+```bash
+aws s3 cp templates/cloudformation/sftp-server.yaml \
+  s3://<project_name>-sftp-cloudformation-template-bucket/sftp-server.yaml
+
+aws s3 cp templates/cloudformation/sftp-user.yaml \
+  s3://<project_name>-sftp-cloudformation-template-bucket/sftp-user.yaml
+```
+
+### 8. Deploy
+
+```bash
+cdk bootstrap   # first time only
+cdk deploy
+```
+
+---
+
+## Usage
+
+### Start / Stop the SFTP server
+
+Invoke the `<project_name>-sftp-start-stop-lambda` with a payload:
+
+```bash
+# Start
+aws lambda invoke \
+  --function-name <project_name>-sftp-start-stop-lambda \
+  --payload '{"action": "start"}' \
+  response.json
+
+# Stop
+aws lambda invoke \
+  --function-name <project_name>-sftp-start-stop-lambda \
+  --payload '{"action": "stop"}' \
+  response.json
+```
+
+Slack notifications are sent automatically on start, stop, and errors.
+
+### Connect via SFTP
+
+```bash
+sftp -i ~/.ssh/your_private_key AliceStaging@<elastic_ip>
+```
+
+---
+
+## CDK commands
+
+```bash
+cdk ls        # list stacks
+cdk synth     # emit CloudFormation template
+cdk diff      # diff deployed vs local
+cdk deploy    # deploy to AWS
+cdk destroy   # destroy permanent infrastructure
+```
+
+---
+
+## Project structure
+
+```text
+.
+├── app.py                                  # CDK entry point
+├── cdk.json                                # CDK config
+├── configs/
+│   └── config.sample.yml                  # Config template
+├── templates/
+│   ├── cloudformation/
+│   │   ├── sftp-server.yaml               # SFTP server + NLB + users
+│   │   └── sftp-user.yaml                 # Per-user nested stack
+│   ├── infrastructure/
+│   │   └── infrastructure_stack.py        # CDK stack (S3, IAM, Lambda)
+│   └── lambda/
+│       ├── start_stop_sftp_server/
+│       │   └── sftp_start_stop_aws_lambda.py
+│       └── handle_s3_events/
+│           └── handle_s3_events.py
+├── utilities/
+│   └── utility.py                         # Config loader, helpers
+├── requirements.txt
+└── requirements-dev.txt
+```
